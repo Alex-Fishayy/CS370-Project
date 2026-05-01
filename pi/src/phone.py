@@ -1,6 +1,6 @@
 """Phone detection using TFLite SSD MobileNet V1 COCO.
 
-No PyTorch/ultralytics required — uses tflite-runtime (~5MB wheel)
+No PyTorch/ultralytics required -- uses tflite-runtime (~5MB wheel)
 with a 4MB quantized COCO model downloaded by setup.sh.
 """
 import cv2
