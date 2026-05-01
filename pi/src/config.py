@@ -33,9 +33,9 @@ OUTPUT_FPS = 30              # for annotated output video
 # Logging
 DB_PATH = "attention_log.db"
 
-# YOLO
-YOLO_MODEL = "yolov8n.pt"    # auto-downloads on first use
-PHONE_CLASS_ID = 67          # COCO class for "cell phone"
+# TFLite phone detection (no PyTorch needed)
+TFLITE_MODEL = "models/detect.tflite"   # downloaded by setup.sh
+PHONE_CLASS_ID = 76          # 0-indexed COCO class for "cell phone" (77 in 1-indexed labelmap)
 
 # Gaze tracking
 GAZE_THRESHOLD = 0.45        # normalized iris offset [0-1]; beyond this = looking away

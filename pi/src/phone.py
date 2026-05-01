@@ -1,35 +1,56 @@
-"""Phone detection using Ultralytics YOLOv8n.
+"""Phone detection using TFLite SSD MobileNet V1 COCO.
 
-Returns list of phone bboxes per frame. The pipeline associates them
-with nearby faces in scoring.py.
+No PyTorch/ultralytics required — uses tflite-runtime (~5MB wheel)
+with a 4MB quantized COCO model downloaded by setup.sh.
 """
+import cv2
 import numpy as np
-from ultralytics import YOLO
+import tflite_runtime.interpreter as tflite
 
 from . import config
 
 
 class PhoneDetector:
-    def __init__(self, model_name: str = config.YOLO_MODEL):
-        # Ultralytics will auto-download yolov8n.pt on first use.
-        self.model = YOLO(model_name)
+    def __init__(self, model_path: str = config.TFLITE_MODEL):
+        self.interpreter = tflite.Interpreter(model_path=model_path)
+        self.interpreter.allocate_tensors()
+
+        self._inp = self.interpreter.get_input_details()[0]
+        # Sort output tensors by index: boxes, classes, scores, count
+        outs = sorted(self.interpreter.get_output_details(), key=lambda x: x["index"])
+        self._out_boxes, self._out_cls, self._out_scores, self._out_count = outs
+
+        self._inp_h = self._inp["shape"][1]
+        self._inp_w = self._inp["shape"][2]
 
     def detect(self, frame_bgr: np.ndarray) -> list[tuple]:
         """Returns list of (x1, y1, x2, y2, conf) for phones."""
-        results = self.model.predict(
-            frame_bgr,
-            classes=[config.PHONE_CLASS_ID],
-            conf=config.PHONE_CONF_THRESHOLD,
-            verbose=False,
+        h, w = frame_bgr.shape[:2]
+
+        rgb = cv2.cvtColor(
+            cv2.resize(frame_bgr, (self._inp_w, self._inp_h)), cv2.COLOR_BGR2RGB
         )
+        self.interpreter.set_tensor(self._inp["index"], np.expand_dims(rgb, 0))
+        self.interpreter.invoke()
+
+        # Outputs are dequantized floats even for uint8 model
+        boxes   = self.interpreter.get_tensor(self._out_boxes["index"])[0]    # (N,4) ymin,xmin,ymax,xmax normalised
+        classes = self.interpreter.get_tensor(self._out_cls["index"])[0]      # (N,)
+        scores  = self.interpreter.get_tensor(self._out_scores["index"])[0]   # (N,)
+        count   = int(self.interpreter.get_tensor(self._out_count["index"])[0])
+
         phones = []
-        for r in results:
-            if r.boxes is None:
+        for i in range(count):
+            if scores[i] < config.PHONE_CONF_THRESHOLD:
                 continue
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
-                phones.append((int(x1), int(y1), int(x2), int(y2), conf))
+            if int(classes[i]) != config.PHONE_CLASS_ID:
+                continue
+            ymin, xmin, ymax, xmax = boxes[i]
+            phones.append((
+                int(xmin * w), int(ymin * h),
+                int(xmax * w), int(ymax * h),
+                float(scores[i]),
+            ))
         return phones
 
 

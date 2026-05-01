@@ -14,7 +14,7 @@ done
 sudo apt-get update -qq
 sudo apt-get install -y \
     libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender-dev \
-    libopenblas-dev wget curl
+    libopenblas-dev wget curl unzip
 
 echo "[2/5] Installing Miniforge (pre-built Python 3.11 for aarch64, no compile needed)..."
 MINIFORGE_INSTALLER="$HOME/Miniforge3-aarch64.sh"
@@ -48,8 +48,16 @@ PIP="$MINIFORGE_ROOT/envs/attention/bin/pip"
     --no-extra-index-url \
     'mediapipe>=0.10.9,<0.11'
 "$PIP" install numpy opencv-python filterpy scipy
-# ultralytics auto-pulls torch/torchvision for aarch64
-"$PIP" install ultralytics
+# tflite-runtime replaces ultralytics — no PyTorch, tiny wheel (~5MB)
+"$PIP" install tflite-runtime
+
+echo "  Downloading SSD MobileNet V1 COCO TFLite model (~4MB)..."
+mkdir -p models
+wget -q --show-progress \
+    "https://storage.googleapis.com/download.tensorflow.org/models/tflite/coco_ssd_mobilenet_v1_1.0_quant_2018_06_29.zip" \
+    -O models/detect.zip
+unzip -o models/detect.zip detect.tflite -d models/
+rm models/detect.zip
 
 echo "[5/5] Done!"
 echo ""
