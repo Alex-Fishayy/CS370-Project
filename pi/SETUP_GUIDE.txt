@@ -5,11 +5,10 @@
 REQUIREMENTS
 ------------
 - Raspberry Pi 4 (4GB RAM) or Pi 5
-- 64-bit Raspberry Pi OS (Bookworm recommended)
-- Python 3.11 (comes pre-installed on Bookworm)
+- 64-bit Raspberry Pi OS (Bookworm recommended, aarch64)
 - USB webcam OR Pi Camera Module (CSI ribbon)
 - Internet connection for first-time setup
-- ~3GB free disk space (for PyTorch + deps)
+- ~4GB free disk space (for Miniforge + PyTorch + deps)
 
 
 STEP 1 — GET THE FILES ON YOUR PI
@@ -33,10 +32,11 @@ STEP 2 — RUN SETUP (ONE TIME ONLY)
 
   This will:
   - Install system libraries (libgl1, libopenblas, etc.)
-  - Create a Python virtual environment at ~/attention_venv
+  - Download and install Miniforge (pre-compiled Python 3.11 for aarch64)
+  - Create a conda env called 'attention' with Python 3.11
   - Install all Python packages (mediapipe, opencv, ultralytics, etc.)
 
-  NOTE: This takes 10-30 minutes on a Pi due to PyTorch downloading.
+  NOTE: This takes ~5-10 minutes (no Python compile step).
   The Pi needs internet access the whole time.
 
   The first time you run the tracker, it will also auto-download
@@ -60,8 +60,8 @@ Pi Camera Module (CSI ribbon cable):
 
 STEP 4 — RUN THE TRACKER
 --------------------------
-Activate the virtual environment first:
-  source ~/attention_venv/bin/activate
+Activate the conda environment first:
+  source ~/miniforge3/bin/activate attention
 
 Then run:
   cd ~/attention
