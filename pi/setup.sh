@@ -20,7 +20,9 @@ echo "[2/5] Installing Miniforge (pre-built Python 3.11 for aarch64, no compile 
 MINIFORGE_INSTALLER="$HOME/Miniforge3-aarch64.sh"
 MINIFORGE_ROOT="$HOME/miniforge3"
 
-if ! [ -d "$MINIFORGE_ROOT" ]; then
+if ! [ -x "$MINIFORGE_ROOT/bin/conda" ]; then
+    # Remove any partial/broken install before re-installing
+    rm -rf "$MINIFORGE_ROOT"
     wget -q --show-progress \
         "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh" \
         -O "$MINIFORGE_INSTALLER"
