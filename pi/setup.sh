@@ -16,8 +16,8 @@ source ~/attention_venv/bin/activate
 
 echo "[3/4] Installing Python packages (takes a while on Pi)..."
 pip install --upgrade pip wheel
-# mediapipe: no-deps first to skip slow jaxlib download, then install deps manually
-pip install --no-deps mediapipe==0.10.14
+# mediapipe: must use PyPI directly — piwheels has no aarch64 wheel for mediapipe
+pip install --index-url https://pypi.org/simple/ 'mediapipe>=0.10.9'
 pip install numpy opencv-python filterpy scipy
 # ultralytics auto-pulls torch/torchvision for aarch64
 pip install ultralytics
