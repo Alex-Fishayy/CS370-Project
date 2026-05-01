@@ -4,6 +4,11 @@
 set -e
 
 echo "[1/5] Installing system dependencies..."
+# Wait for any background apt/dpkg process to release the lock (auto-updater runs on boot)
+echo "  Waiting for apt lock..."
+while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+    sleep 2
+done
 sudo apt-get update -qq
 sudo apt-get install -y \
     libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender-dev \
