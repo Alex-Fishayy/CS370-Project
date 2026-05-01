@@ -4,6 +4,8 @@
 set -e
 
 echo "[1/5] Installing system dependencies..."
+# Recover from any previously interrupted dpkg run
+sudo dpkg --configure -a
 # Wait for any background apt/dpkg process to release the lock (auto-updater runs on boot)
 echo "  Waiting for apt lock..."
 while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
