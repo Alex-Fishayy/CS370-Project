@@ -35,9 +35,6 @@ from src.pipeline import Pipeline
 from src.visualize import draw_face, draw_phones, draw_hud
 
 
-def open_source(src):
-
-
 # ── MJPEG stream ──────────────────────────────────────────────────────────────
 _stream_frame = None
 _stream_lock = threading.Lock()
