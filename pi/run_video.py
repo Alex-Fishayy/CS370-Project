@@ -113,6 +113,8 @@ def main():
     cap1 = open_source(args.source)
     if not cap1.isOpened():
         print(f"[error] could not open source: {args.source}")
+        print("[hint]  run: ls /dev/video*  to see available cameras")
+        print("[hint]  if permission denied: sudo usermod -aG video $USER  then reboot")
         return 1
     cap2 = None
     if args.source2:
@@ -161,7 +163,7 @@ def main():
             frame_idx += 1
 
             # Draw
-            if not args.no_display or writer is not None:
+            if not args.no_display or writer is not None or args.stream:
                 vis = frame1.copy()
                 draw_phones(vis, out1.phones)
                 for track_id, bbox, result in out1.faces:
