@@ -17,10 +17,14 @@ sudo apt-get install -y \
     libopenblas-dev wget curl unzip
 
 echo "[2/5] Installing Miniforge (pre-built Python 3.11 for aarch64, no compile needed)..."
-MINIFORGE_INSTALLER="$HOME/Miniforge3-aarch64.sh"
 MINIFORGE_ROOT="$HOME/miniforge3"
+# Use Miniforge base Python directly — it's already 3.11, no conda env needed
+PYTHON311="$MINIFORGE_ROOT/bin/python"
 
-if ! [ -x "$MINIFORGE_ROOT/bin/conda" ]; then
+echo "[2/5] Installing Miniforge (pre-built Python 3.11 for aarch64, no compile needed)..."
+MINIFORGE_INSTALLER="$HOME/Miniforge3-aarch64.sh"
+
+if ! [ -x "$MINIFORGE_ROOT/bin/python" ]; then
     # Remove any partial/broken install before re-installing
     rm -rf "$MINIFORGE_ROOT"
     wget -q --show-progress \
@@ -30,19 +34,15 @@ if ! [ -x "$MINIFORGE_ROOT/bin/conda" ]; then
     rm "$MINIFORGE_INSTALLER"
 fi
 
-CONDA="$MINIFORGE_ROOT/bin/conda"
-PYTHON311="$MINIFORGE_ROOT/envs/attention/bin/python"
-
-echo "[3/5] Creating conda env 'attention' with Python 3.11..."
-if ! "$CONDA" env list | grep -q "^attention "; then
-    "$CONDA" create -n attention python=3.11 -y
-fi
-
 # Confirm 3.11
-"$PYTHON311" --version | grep -q "3.11" || { echo "ERROR: Python 3.11 not found in conda env"; exit 1; }
+"$PYTHON311" --version | grep -q "3.11" || { echo "ERROR: Miniforge Python is not 3.11"; exit 1; }
+
+echo "[3/5] Creating virtualenv at ~/attention_venv..."
+rm -rf ~/attention_venv
+"$PYTHON311" -m venv ~/attention_venv
 
 echo "[4/5] Installing Python packages..."
-PIP="$MINIFORGE_ROOT/envs/attention/bin/pip"
+PIP=~/attention_venv/bin/pip
 "$PIP" install --upgrade pip wheel
 # mediapipe: PyPI only, block piwheels (Pi OS adds piwheels as extra-index in /etc/pip.conf)
 "$PIP" install \
@@ -64,7 +64,7 @@ rm models/detect.zip
 echo "[5/5] Done!"
 echo ""
 echo "To run:"
-echo "  source ~/miniforge3/bin/activate attention"
+echo "  source ~/attention_venv/bin/activate"
 echo "  python run_video.py --source 0"
 echo ""
 echo "If using Pi Camera Module (CSI ribbon cable):"
