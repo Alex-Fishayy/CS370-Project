@@ -1,0 +1,7 @@
+# Raspberry Pi 4/5 (64-bit OS, aarch64, Python 3.11)
+numpy>=1.24.0
+opencv-python>=4.8.0
+mediapipe>=0.10.9
+ultralytics>=8.0.0
+filterpy>=1.4.5
+scipy>=1.10.0
