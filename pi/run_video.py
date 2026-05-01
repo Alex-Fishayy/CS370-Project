@@ -21,6 +21,8 @@ import sys
 import time
 import uuid
 from pathlib import Path
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
 
@@ -31,6 +33,44 @@ from src import config
 from src.logger import AttentionLogger
 from src.pipeline import Pipeline
 from src.visualize import draw_face, draw_phones, draw_hud
+
+
+def open_source(src):
+
+
+# ── MJPEG stream ──────────────────────────────────────────────────────────────
+_stream_frame = None
+_stream_lock = threading.Lock()
+
+def _set_stream_frame(frame):
+    global _stream_frame
+    jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
+    with _stream_lock:
+        _stream_frame = jpg
+
+class _MjpegHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # silence request logs
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.end_headers()
+        try:
+            while True:
+                with _stream_lock:
+                    frame = _stream_frame
+                if frame:
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                time.sleep(0.033)
+        except Exception:
+            pass
+
+def _start_stream_server(port=8080):
+    server = HTTPServer(("0.0.0.0", port), _MjpegHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return port
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def open_source(src):
@@ -55,6 +95,7 @@ def main():
     ap.add_argument("--source2", default=None, help="optional second source")
     ap.add_argument("--out", default=None, help="path to write annotated output video (first camera only)")
     ap.add_argument("--no-display", action="store_true")
+    ap.add_argument("--stream", action="store_true", help="serve MJPEG stream on port 8080")
     ap.add_argument("--session", default=None, help="session id (default: uuid)")
     ap.add_argument("--db", default=config.DB_PATH)
     ap.add_argument("--max-frames", type=int, default=None,
@@ -63,6 +104,10 @@ def main():
 
     session_id = args.session or f"session_{int(time.time())}"
     print(f"[info] session_id = {session_id}")
+
+    if args.stream:
+        port = _start_stream_server()
+        print(f"[info] MJPEG stream at http://<pi-ip>:{port}")
 
     # Open sources
     cap1 = open_source(args.source)
@@ -130,6 +175,9 @@ def main():
 
                 if writer is not None:
                     writer.write(vis)
+
+                if args.stream:
+                    _set_stream_frame(vis)
 
                 if not args.no_display:
                     cv2.imshow("attention cam1", vis)
