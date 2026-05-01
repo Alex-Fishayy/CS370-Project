@@ -47,10 +47,10 @@ PIP="$MINIFORGE_ROOT/envs/attention/bin/pip"
 # (--no-extra-index-url was removed in pip 26)
 export PIP_CONFIG_FILE=/dev/null
 "$PIP" install --upgrade pip wheel
-# mediapipe: PyPI only
+# mediapipe: PyPI only, pin to 0.10.9 (avoids jax dependency added in later versions)
 "$PIP" install \
     --index-url https://pypi.org/simple/ \
-    'mediapipe>=0.10.9,<0.11'
+    'mediapipe==0.10.9'
 "$PIP" install numpy opencv-python filterpy scipy
 # tflite-runtime replaces ultralytics — no PyTorch, tiny wheel (~5MB)
 "$PIP" install tflite-runtime
