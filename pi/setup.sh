@@ -7,8 +7,8 @@ echo "[1/4] Installing system dependencies..."
 sudo apt-get update -qq
 sudo apt-get install -y \
     python3-pip python3-venv \
-    libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
-    libopenblas-dev libatlas-base-dev
+    libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender-dev \
+    libopenblas-dev
 
 echo "[2/4] Creating virtual environment at ~/attention_venv ..."
 python3 -m venv ~/attention_venv
