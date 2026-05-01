@@ -1,0 +1,115 @@
+====================================================
+  ATTENTION TRACKER — RASPBERRY PI SETUP GUIDE
+====================================================
+
+REQUIREMENTS
+------------
+- Raspberry Pi 4 (4GB RAM) or Pi 5
+- 64-bit Raspberry Pi OS (Bookworm recommended)
+- Python 3.11 (comes pre-installed on Bookworm)
+- USB webcam OR Pi Camera Module (CSI ribbon)
+- Internet connection for first-time setup
+- ~3GB free disk space (for PyTorch + deps)
+
+
+STEP 1 — GET THE FILES ON YOUR PI
+----------------------------------
+Option A: USB drive
+  Copy just this "pi" folder onto a USB drive,
+  plug into Pi, then copy to home directory:
+    cp -r /media/pi/USBDRIVE/pi ~/attention
+
+Option B: Git clone (Pi must have internet)
+  git clone https://github.com/Alex-Fishayy/CS370-Project -b jackson-dev
+  cp -r CS370-Project/pi ~/attention
+
+Then navigate to it:
+  cd ~/attention
+
+
+STEP 2 — RUN SETUP (ONE TIME ONLY)
+------------------------------------
+  bash setup.sh
+
+  This will:
+  - Install system libraries (libgl1, libopenblas, etc.)
+  - Create a Python virtual environment at ~/attention_venv
+  - Install all Python packages (mediapipe, opencv, ultralytics, etc.)
+
+  NOTE: This takes 10-30 minutes on a Pi due to PyTorch downloading.
+  The Pi needs internet access the whole time.
+
+  The first time you run the tracker, it will also auto-download
+  yolov8n.pt (~7MB, YOLO phone detection model). That's normal.
+
+
+STEP 3 — CAMERA SETUP
+-----------------------
+USB Webcam (easiest):
+  Just plug it in. Go to Step 4.
+
+Pi Camera Module (CSI ribbon cable):
+  Enable camera in raspi-config:
+    sudo raspi-config
+    -> Interface Options -> Camera -> Enable
+    sudo reboot
+
+  After reboot, load the V4L2 driver (run once per boot):
+    sudo modprobe bcm2835-v4l2
+
+
+STEP 4 — RUN THE TRACKER
+--------------------------
+Activate the virtual environment first:
+  source ~/attention_venv/bin/activate
+
+Then run:
+  cd ~/attention
+  python run_video.py --source 0
+
+Controls:
+  Q  — quit
+
+
+OPTIONAL FLAGS
+--------------
+  --source 1          Use second camera (if you have two plugged in)
+  --no-display        Headless mode, no window (saves CPU, logs to DB only)
+  --out out.mp4       Save annotated video to a file
+  --max-frames 300    Stop after 300 frames (good for testing)
+
+Example headless run (e.g. running over SSH):
+  python run_video.py --source 0 --no-display
+
+
+VIEWING LOGS
+------------
+Logs are saved to attention_log.db (SQLite) in the same folder.
+
+Generate a report:
+  python generate_report.py --db attention_log.db
+
+
+TROUBLESHOOTING
+---------------
+"could not open source: 0"
+  -> Webcam not recognized. Try unplugging and replugging.
+     Run: ls /dev/video* to see available devices.
+     Try --source 1 or --source 2.
+
+"faces=0" every frame / nothing detected
+  -> Make sure there's good lighting.
+     Camera might need a second to warm up.
+
+Screen not showing (SSH session)
+  -> Either use --no-display, or enable X11 forwarding:
+     ssh -X pi@<ip> and run from there.
+
+Very slow / low FPS
+  -> Normal on Pi, expect 5-15fps with 1-2 faces.
+     Use --no-display to skip rendering and go faster.
+     The analysis only runs every 15 frames to save CPU.
+
+ModuleNotFoundError
+  -> Make sure you ran: source ~/attention_venv/bin/activate
+     before running python.
