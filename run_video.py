@@ -35,11 +35,15 @@ from src.visualize import draw_face, draw_phones, draw_hud
 
 def open_source(src):
     """Accepts a file path or an integer camera index."""
+    import platform
     try:
         idx = int(src)
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)  # DirectShow backend for Windows webcams
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(idx)
+        if platform.system() == "Windows":
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)  # DirectShow avoids 0-frame issue on Windows
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(idx)
+        else:
+            cap = cv2.VideoCapture(idx)  # V4L2 default on Linux/Pi
         return cap
     except ValueError:
         return cv2.VideoCapture(str(src))
