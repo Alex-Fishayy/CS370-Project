@@ -1,0 +1,18 @@
+[Unit]
+Description=WiFi Auto-Connect — scans for networks every 30 seconds
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/wifi-scan.sh
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+[Unit]
+Description=Attention Tracker — MJPEG stream on port 8080
+# Start after network is available so the stream is reachable
+After=network-online.target NetworkManager-wait-online.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/attention
+
+# Use the Miniforge conda environment's Python directly
+ExecStart=/home/pi/miniforge3/envs/attention/bin/python \
+    /home/pi/attention/run_video.py \
+    --source 0 \
+    --no-display \
+    --stream
+
+Restart=on-failure
+RestartSec=10
+
+# Log to journald (view with: journalctl -u attention-tracker -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

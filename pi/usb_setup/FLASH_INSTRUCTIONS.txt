@@ -1,0 +1,146 @@
+================================================================
+ ATTENTION TRACKER — USB BOOT SETUP GUIDE
+================================================================
+This guide turns a blank USB drive into a bootable Raspberry Pi
+drive that auto-starts the attention tracker and auto-connects to
+WiFi on every boot.
+
+⚠  SECURITY NOTE: WiFi passwords are stored as plain text in
+   firstrun.sh and in NetworkManager connection files on the Pi.
+   Do not lose the USB or leave it accessible to others.
+
+----------------------------------------------------------------
+WHAT YOU NEED
+----------------------------------------------------------------
+• USB drive, 8 GB minimum (16 GB+ recommended)
+• The Raspberry Pi Imager app (free):
+    https://www.raspberrypi.com/software/
+• This folder open in File Explorer
+
+----------------------------------------------------------------
+STEP 1 — Flash Raspberry Pi OS to the USB
+----------------------------------------------------------------
+1. Open Raspberry Pi Imager.
+2. Click "Choose Device" → pick your Pi model (Pi 4 or Pi 5).
+3. Click "Choose OS"
+      → "Raspberry Pi OS (other)"
+      → "Raspberry Pi OS Lite (64-bit)"   ← no desktop needed
+4. Click "Choose Storage" → select your USB drive.
+   ⚠  Double-check — this ERASES the drive.
+5. Click the ⚙ gear icon (or press Ctrl+Shift+X) for Advanced:
+      Hostname:        attention-pi
+      Enable SSH:      ✓  (use password authentication)
+      Username:        pi
+      Password:        (choose something — you'll use this for SSH)
+      WiFi SSID:       Jackson's iPhone     ← lets Pi do first boot
+      WiFi Password:   jackson12
+      WiFi Country:    US
+6. Click "Save", then "Write".  Wait ~5–10 minutes.
+
+----------------------------------------------------------------
+STEP 2 — Copy files to the boot partition
+----------------------------------------------------------------
+After flashing, the USB shows up in Windows as a small drive
+called "bootfs" (or "boot").  Open it.
+
+Copy ALL of the following into that drive's ROOT folder:
+
+  FROM this folder:
+    usb_setup\firstrun.sh              → bootfs:\firstrun.sh
+    usb_setup\wifi-scan.sh             → bootfs:\usb_setup\wifi-scan.sh
+    usb_setup\attention-tracker.service→ bootfs:\usb_setup\attention-tracker.service
+    usb_setup\wifi-autoconnect.service → bootfs:\usb_setup\wifi-autoconnect.service
+
+  The entire pi\ software folder:
+    pi\  (this whole directory)        → bootfs:\attention\
+    (so bootfs:\attention\run_video.py, bootfs:\attention\src\, etc.)
+
+  Your YOLO model (if using the laptop version):
+    yolov8n.pt                         → bootfs:\attention\yolov8n.pt
+
+Quick copy commands (run in PowerShell from the project root,
+replace X: with your USB drive letter):
+
+    Copy-Item "pi\usb_setup\firstrun.sh"              X:\firstrun.sh
+    New-Item -ItemType Directory -Force X:\usb_setup
+    Copy-Item "pi\usb_setup\wifi-scan.sh"             X:\usb_setup\
+    Copy-Item "pi\usb_setup\attention-tracker.service" X:\usb_setup\
+    Copy-Item "pi\usb_setup\wifi-autoconnect.service"  X:\usb_setup\
+    Copy-Item "pi\" X:\attention\ -Recurse
+
+----------------------------------------------------------------
+STEP 3 — Add firstrun hook to cmdline.txt
+----------------------------------------------------------------
+On the bootfs drive, open "cmdline.txt" in Notepad.
+It is ONE long line.  At the END of that line (no newline),
+add exactly this (with a leading space):
+
+   systemd.run=/boot/firmware/firstrun.sh systemd.run_success_action=reboot systemd.unit=kernel-command-line.target
+
+Save and close.  The file must still be a single line.
+
+Note: on very old Pi OS images the boot path is /boot not
+/boot/firmware.  If setup fails, try:
+   systemd.run=/boot/firstrun.sh ...
+
+----------------------------------------------------------------
+STEP 4 — First boot (plug USB into Pi)
+----------------------------------------------------------------
+1. Safely eject the USB from your laptop.
+2. Plug it into the Raspberry Pi.
+3. Power the Pi on.
+4. First-boot setup takes ~10–15 minutes:
+     • Installs Miniforge + Python packages
+     • Configures WiFi credentials
+     • Enables the attention-tracker and wifi-autoconnect services
+     • Reboots automatically when done
+5. After the reboot, the tracker starts automatically.
+
+----------------------------------------------------------------
+STEP 5 — Access the live stream
+----------------------------------------------------------------
+Once the Pi is on a network, open a browser on any device on
+the SAME network and go to:
+
+    http://attention-pi.local:8080
+
+Or use the Pi's IP address:
+    http://<pi-ip>:8080
+
+To find the IP:
+    nmap -sn 192.168.1.0/24        (on Linux/Mac)
+    arp -a | findstr attention-pi   (on Windows)
+
+----------------------------------------------------------------
+MANAGING THE SERVICES
+----------------------------------------------------------------
+SSH into the Pi first:  ssh pi@attention-pi.local
+
+Check if tracker is running:
+    systemctl status attention-tracker
+    journalctl -u attention-tracker -f
+
+Check WiFi auto-connect:
+    systemctl status wifi-autoconnect
+    journalctl -u wifi-autoconnect -f
+
+Stop / start:
+    sudo systemctl stop  attention-tracker
+    sudo systemctl start attention-tracker
+
+View first-boot log:
+    cat /var/log/firstrun.log
+
+----------------------------------------------------------------
+WIFI BEHAVIOR
+----------------------------------------------------------------
+Priority order for connecting:
+  1. 5G District at Campus West  (priority 20)
+  2. Jackson's iPhone            (priority 10)
+  3. Any open (password-free) network  ← scanned every 30s
+
+⚠  Connecting to open/unknown networks is a security risk.
+   Anyone running a hotspot with no password can intercept
+   your traffic.  Use a VPN if this is a concern.
+
+----------------------------------------------------------------
