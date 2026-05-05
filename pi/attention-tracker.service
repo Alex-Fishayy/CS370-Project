@@ -1,0 +1,25 @@
+[Unit]
+Description=CS370 Attention Tracker
+# Wait for USB subsystem and video devices to be fully enumerated
+After=network.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=cs370
+# Give the user access to /dev/video* devices
+SupplementaryGroups=video
+WorkingDirectory=/home/cs370/attention
+Environment=PYTHONUNBUFFERED=1
+# Extra 30s cushion after udev settles so USB camera is fully ready
+ExecStartPre=/bin/sleep 30
+ExecStart=/home/cs370/miniforge3/envs/attention/bin/python -u run_video.py --no-display --stream
+Restart=on-failure
+RestartSec=20
+StandardOutput=append:/home/cs370/tracker.log
+StandardError=append:/home/cs370/tracker.log
+
+[Install]
+WantedBy=multi-user.target

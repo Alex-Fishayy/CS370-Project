@@ -1,32 +1,42 @@
-"""Run the attention pipeline on one or two video files (or webcams).
+"""Multi-camera attention tracker with auto-detection.
+
+Auto-detects all connected cameras, runs a tracking pipeline on each in a
+background thread, and serves a live web dashboard on port 8080:
+
+    http://<pi-ip>:8080          → HTML dashboard (all feeds + DB metrics)
+    http://<pi-ip>:8080/cam/N    → raw MJPEG for camera N
+    http://<pi-ip>:8080/metrics  → JSON metrics
 
 Usage:
-    # Single video file
-    python -m scripts.run_video --source path/to/class.mp4
+    # Auto-detect all cameras, headless + stream
+    python run_video.py --no-display --stream
 
-    # Two video files (treated as two cameras)
-    python -m scripts.run_video --source cam1.mp4 --source2 cam2.mp4
+    # Specify cameras explicitly
+    python run_video.py --source 0,1 --no-display --stream
 
-    # Webcam
-    python -m scripts.run_video --source 0
-
-    # With output video
-    python -m scripts.run_video --source class.mp4 --out annotated.mp4
-
-    # Skip display (faster, headless)
-    python -m scripts.run_video --source class.mp4 --no-display
+    # Single camera (legacy)
+    python run_video.py --source 0
 """
 import argparse
+import json
+import os
+import platform
+import sqlite3
 import sys
-import time
-import uuid
-from pathlib import Path
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
 
 import cv2
 
-# Allow running as a script from the project root
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src import config
@@ -35,189 +45,537 @@ from src.pipeline import Pipeline
 from src.visualize import draw_face, draw_phones, draw_hud
 
 
-# ── MJPEG stream ──────────────────────────────────────────────────────────────
-_stream_frame = None
-_stream_lock = threading.Lock()
+# ── Shared state (written by camera threads, read by HTTP handler) ─────────────
+_lock = threading.Lock()
+_frames: dict = {}   # cam_idx -> latest JPEG bytes
+_stats: dict = {}    # cam_idx -> {faces, attentive, fps, session}
+_db_path: str = ""   # always absolute
+_session_id: str = ""
+_stop_event = threading.Event()
 
-def _set_stream_frame(frame):
-    global _stream_frame
-    jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
-    with _stream_lock:
-        _stream_frame = jpg
 
-class _MjpegHandler(BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass  # silence request logs
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-        self.end_headers()
+def _cpu_temp_c() -> float | None:
+    """Read CPU temperature from thermal zone or vcgencmd (Pi-specific)."""
+    # Standard Linux thermal zone (works on Pi and most ARM boards)
+    for i in range(8):
         try:
-            while True:
-                with _stream_lock:
-                    frame = _stream_frame
-                if frame:
-                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-                time.sleep(0.033)
+            with open(f'/sys/class/thermal/thermal_zone{i}/temp') as f:
+                return round(int(f.read().strip()) / 1000.0, 1)
+        except Exception:
+            continue
+    return None
+
+
+def _cpu_freq_ghz() -> float | None:
+    """Read current CPU clock speed from /proc/cpuinfo or sysfs."""
+    # Try sysfs scaling_cur_freq (most accurate live value)
+    try:
+        with open('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq') as f:
+            return round(int(f.read().strip()) / 1_000_000, 2)
+    except Exception:
+        pass
+    # Fallback: parse /proc/cpuinfo 'cpu MHz'
+    try:
+        with open('/proc/cpuinfo') as f:
+            for line in f:
+                if line.startswith('cpu MHz'):
+                    return round(float(line.split(':')[1].strip()) / 1000, 2)
+    except Exception:
+        pass
+    return None
+
+
+def _sys_stats() -> dict:
+    """CPU %, RAM used/total, temperature, clock. Falls back gracefully."""
+    temp = _cpu_temp_c()
+    freq = _cpu_freq_ghz()
+
+    if not _HAS_PSUTIL:
+        # Fallback: read /proc/meminfo directly (Linux only)
+        try:
+            with open('/proc/meminfo') as f:
+                lines = {l.split(':')[0]: int(l.split()[1]) for l in f if ':' in l}
+            total_kb = lines.get('MemTotal', 0)
+            avail_kb = lines.get('MemAvailable', 0)
+            used_mb  = (total_kb - avail_kb) // 1024
+            total_mb = total_kb // 1024
+            pct_ram  = round(100 * (total_kb - avail_kb) / max(total_kb, 1), 1)
+        except Exception:
+            used_mb = total_mb = 0
+            pct_ram = 0
+        return {"cpu": None, "ram_used_mb": used_mb,
+                "ram_total_mb": total_mb, "ram_pct": pct_ram,
+                "temp_c": temp, "freq_ghz": freq}
+    cpu = psutil.cpu_percent(interval=None)
+    vm  = psutil.virtual_memory()
+    # psutil can also read temp/freq if available, but our direct reads are more reliable on Pi
+    if temp is None:
+        try:
+            temps = psutil.sensors_temperatures()
+            for key in ('cpu_thermal', 'cpu-thermal', 'coretemp'):
+                if key in temps and temps[key]:
+                    temp = round(temps[key][0].current, 1)
+                    break
+        except Exception:
+            pass
+    if freq is None:
+        try:
+            freq = round(psutil.cpu_freq().current / 1000, 2)
+        except Exception:
+            pass
+    return {"cpu": cpu, "ram_used_mb": vm.used // (1024*1024),
+            "ram_total_mb": vm.total // (1024*1024),
+            "ram_pct": round(vm.percent, 1),
+            "temp_c": temp, "freq_ghz": freq}
+
+
+# ── Camera helpers ────────────────────────────────────────────────────────────
+def _open_cam(idx: int):
+    if platform.system() == "Windows":
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(idx)
+    else:
+        cap = cv2.VideoCapture(idx)
+    # Force 720p on every camera
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    return cap
+
+
+def detect_cameras(max_index: int = 8) -> list:
+    """Try indices 0..max_index-1, return those that open and deliver a frame."""
+    found = []
+    for i in range(max_index):
+        cap = _open_cam(i)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                found.append(i)
+                print(f"[info] found camera {i}")
+        cap.release()
+    return found
+
+
+# ── Dashboard HTML ────────────────────────────────────────────────────────────
+_DASHBOARD = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Attention Tracker</title>
+<style>
+  * { box-sizing: border-box; }
+  body { background: #0d0d0d; color: #e0e0e0; font-family: 'Courier New', monospace;
+         margin: 0; padding: 16px; }
+  h1 { margin: 0 0 14px; font-size: 1.3em; color: #7dd3fc; letter-spacing: 0.05em; }
+  h2 { font-size: 0.9em; color: #7dd3fc; margin: 14px 0 6px; border-bottom: 1px solid #1e3a5f; padding-bottom: 3px; }
+  .feeds { display: flex; flex-wrap: wrap; gap: 10px; }
+  .cam-card { background: #161616; border: 1px solid #2a2a2a; border-radius: 6px;
+              padding: 8px; flex: 1 1 300px; min-width: 280px; max-width: 640px; }
+  .cam-card h3 { margin: 0 0 6px; font-size: 0.85em; color: #fbbf24; }
+  .cam-card img { width: 100%; border-radius: 4px; display: block; background: #111; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82em; margin-bottom: 6px; }
+  th { background: #1a1a1a; color: #7dd3fc; padding: 5px 8px; text-align: center;
+       border: 1px solid #2a2a2a; }
+  td { padding: 4px 8px; border: 1px solid #222; text-align: right; }
+  td:first-child, td:nth-child(2) { text-align: left; }
+  .good { color: #4ade80; font-weight: bold; }
+  .warn { color: #fbbf24; font-weight: bold; }
+  .bad  { color: #f87171; font-weight: bold; }
+  .sysbar { display: flex; gap: 24px; font-size: 0.82em; background: #111;
+            border: 1px solid #2a2a2a; border-radius: 4px; padding: 6px 12px;
+            margin-bottom: 12px; }
+  .sysbar span { color: #a0a0a0; }
+  .sysbar b { color: #e0e0e0; }
+  #db-error { font-size: 0.75em; color: #f87171; margin-top: 4px; min-height: 1em; }
+  #status { font-size: 0.75em; color: #555; margin-top: 10px; }
+</style></head><body>
+<h1>Attention Tracker -- Live Dashboard</h1>
+
+<div class="sysbar" id="sysbar">loading system info...</div>
+
+<div class="feeds" id="feeds"></div>
+
+<h2>Live per-camera</h2>
+<table><thead><tr>
+  <th>Camera</th><th>Faces</th><th>Attentive</th><th>Rate</th><th>FPS</th>
+</tr></thead><tbody id="live-body"></tbody></table>
+
+<h2>DB metrics -- session total</h2>
+<div id="db-error"></div>
+<table><thead><tr>
+  <th>Cam</th><th>Track</th><th>Samples</th>
+  <th>Attn%</th><th>Eyes%</th><th>Pose%</th><th>NoPhone%</th>
+</tr></thead><tbody id="db-body"></tbody></table>
+
+<div id="status">connecting...</div>
+
+<script>
+let knownCams = null;
+
+function cls(pct) {
+  return pct >= 70 ? 'good' : pct >= 50 ? 'warn' : 'bad';
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/metrics');
+    const d = await r.json();
+
+    // Camera feed tiles
+    if (JSON.stringify(d.cameras) !== JSON.stringify(knownCams)) {
+      knownCams = d.cameras;
+      const feeds = document.getElementById('feeds');
+      feeds.innerHTML = '';
+      d.cameras.forEach(idx => {
+        feeds.innerHTML +=
+          `<div class="cam-card"><h3>Camera ${idx}</h3>` +
+          `<img src="/cam/${idx}" alt="Camera ${idx}"></div>`;
+      });
+    }
+
+    // Live table
+    let live = '';
+    (d.live || []).forEach(s => {
+      const rate = s.faces > 0 ? Math.round(100 * s.attentive / s.faces) : 0;
+      live += `<tr><td>Cam ${s.cam}</td><td>${s.faces}</td><td>${s.attentive}</td>` +
+              `<td class="${cls(rate)}">${rate}%</td><td>${s.fps}</td></tr>`;
+    });
+    document.getElementById('live-body').innerHTML = live;
+
+    // DB table
+    let db = '';
+    if (d.db_rows && d.db_rows.length) {
+      d.db_rows.forEach(row => {
+        db += `<tr><td>${row.cam}</td><td>#${row.track}</td><td>${row.n}</td>` +
+              `<td class="${cls(row.attn_pct)}">${row.attn_pct}%</td>` +
+              `<td class="${cls(row.eyes_pct)}">${row.eyes_pct}%</td>` +
+              `<td class="${cls(row.pose_pct)}">${row.pose_pct}%</td>` +
+              `<td class="${cls(row.nophone_pct)}">${row.nophone_pct}%</td></tr>`;
+      });
+    } else {
+      db = '<tr><td colspan="7" style="text-align:center;color:#555">no data yet</td></tr>';
+    }
+    document.getElementById('db-body').innerHTML = db;
+
+    // System bar
+    const sys = d.sys || {};
+    const cpu = sys.cpu != null ? sys.cpu + '%' : 'n/a';
+    const ram = sys.ram_used_mb != null
+      ? sys.ram_used_mb + ' / ' + sys.ram_total_mb + ' MB (' + sys.ram_pct + '%%)'
+      : 'n/a';
+    const temp = sys.temp_c != null ? sys.temp_c + ' C' : 'n/a';
+    const freq = sys.freq_ghz != null ? sys.freq_ghz + ' GHz' : 'n/a';
+    document.getElementById('sysbar').innerHTML =
+      '<span>CPU:</span> <b>' + cpu + '</b>' +
+      '&nbsp;&nbsp;<span>Temp:</span> <b>' + temp + '</b>' +
+      '&nbsp;&nbsp;<span>Freq:</span> <b>' + freq + '</b>' +
+      '&nbsp;&nbsp;<span>RAM:</span> <b>' + ram + '</b>' +
+      '&nbsp;&nbsp;<span>Session:</span> <b>' + (d.session || '-') + '</b>';
+
+    // DB error
+    document.getElementById('db-error').textContent = d.db_error || '';
+
+    document.getElementById('status').textContent =
+      'last update: ' + new Date().toLocaleTimeString();
+  } catch(e) {
+    document.getElementById('status').textContent = 'connection error: ' + e;
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script></body></html>"""
+
+
+# ── HTTP server ───────────────────────────────────────────────────────────────
+class _Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # silence per-request logs
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+
+        if path == "/":
+            body = _DASHBOARD.encode()
+            self._respond(200, "text/html", body)
+
+        elif path.startswith("/cam/"):
+            try:
+                idx = int(path.rsplit("/", 1)[-1])
+            except ValueError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            try:
+                while not _stop_event.is_set():
+                    with _lock:
+                        jpg = _frames.get(idx)
+                    if jpg:
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+                        )
+                    time.sleep(0.033)
+            except Exception:
+                pass
+
+        elif path == "/metrics":
+            with _lock:
+                cams = sorted(_frames.keys())
+                live = [{"cam": k, **v} for k, v in _stats.items()]
+
+            db_rows = []
+            db_error = ""
+            if _db_path and _session_id:
+                try:
+                    # Use absolute path + WAL mode to read while writer thread writes
+                    conn = sqlite3.connect(_db_path, timeout=10,
+                                           check_same_thread=False)
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    rows = conn.execute(
+                        """SELECT camera_id, track_id,
+                                  COUNT(*) AS n,
+                                  ROUND(100.0*SUM(attentive)/COUNT(*), 1),
+                                  ROUND(100.0*SUM(eyes_open)/COUNT(*), 1),
+                                  ROUND(100.0*SUM(head_pose_ok)/COUNT(*), 1),
+                                  ROUND(100.0*SUM(no_phone)/COUNT(*), 1)
+                           FROM measurements
+                           WHERE session_id=?
+                           GROUP BY camera_id, track_id
+                           ORDER BY camera_id, track_id""",
+                        (_session_id,),
+                    ).fetchall()
+                    conn.close()
+                    db_rows = [
+                        {"cam": r[0], "track": r[1], "n": r[2],
+                         "attn_pct": r[3] or 0, "eyes_pct": r[4] or 0,
+                         "pose_pct": r[5] or 0, "nophone_pct": r[6] or 0}
+                        for r in rows
+                    ]
+                except Exception as exc:
+                    db_error = str(exc)
+
+            payload = {
+                "cameras": cams,
+                "live": live,
+                "db_rows": db_rows,
+                "db_error": db_error,
+                "session": _session_id,
+                "sys": _sys_stats(),
+            }
+            body = json.dumps(payload).encode()
+            self._respond(200, "application/json", body)
+
+        else:
+            self.send_error(404)
+
+    def _respond(self, code, content_type, body: bytes):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _start_server(port: int = 8080):
+    server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"[info] dashboard → http://0.0.0.0:{port}")
+
+
+# ── Per-camera worker thread ──────────────────────────────────────────────────
+def _camera_worker(cam_idx: int, logger: AttentionLogger, session_id: str,
+                   no_display: bool, max_frames, analysis_every: int):
+    cap = _open_cam(cam_idx)
+    if not cap.isOpened():
+        print(f"[cam {cam_idx}] failed to open — skipping")
+        return
+
+    pipe = Pipeline(camera_id=cam_idx, logger=logger, analysis_every=analysis_every)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[cam {cam_idx}] resolution {w}x{h}  analysis_every={analysis_every}", flush=True)
+
+    # ── Shared state between capture loop and pipeline thread ─────────────────
+    _buf_lock   = threading.Lock()
+    _buf_frame  = [None]   # latest raw frame from cap.read()
+    _buf_fid    = [0]      # increments each capture so pipeline knows if new frame arrived
+    _buf_out    = [None]   # latest FrameOutput from pipeline
+    _buf_nattn  = [0]
+    _fps_val    = [0.0]
+    _t_fps      = [time.time()]
+
+    # ── Pipeline thread — runs at MediaPipe speed (~10 fps) ───────────────────
+    def _pipeline_loop():
+        last_fid = 0
+        pipeline_idx = 0
+        t_start = time.time()
+        while not _stop_event.is_set():
+            with _buf_lock:
+                fid   = _buf_fid[0]
+                frame = _buf_frame[0]
+            if frame is None or fid == last_fid:
+                time.sleep(0.002)
+                continue
+            last_fid = fid
+            pipeline_idx += 1
+
+            out    = pipe.process(frame)
+            n_attn = sum(1 for _, _, r in out.faces if r.attentive)
+
+            with _buf_lock:
+                _buf_out[0]   = out
+                _buf_nattn[0] = n_attn
+
+            with _lock:
+                _stats[cam_idx] = {
+                    "faces":    len(out.faces),
+                    "attentive": n_attn,
+                    "fps":       round(_fps_val[0], 1),
+                    "session":   session_id,
+                }
+
+            if pipeline_idx % 30 == 0:
+                elapsed = time.time() - t_start
+                print(f"[cam {cam_idx}] pipeline {pipeline_idx} frames  "
+                      f"avg {pipeline_idx/elapsed:.1f} fps  faces={len(out.faces)}", flush=True)
+
+    pt = threading.Thread(target=_pipeline_loop, daemon=True, name=f"pipeline-{cam_idx}")
+    pt.start()
+
+    # ── Capture loop — runs at camera fps (~30 fps) ───────────────────────────
+    capture_idx = 0
+    try:
+        while not _stop_event.is_set():
+            ok, frame = cap.read()
+            if not ok:
+                time.sleep(0.05)
+                ok, frame = cap.read()
+                if not ok:
+                    print(f"[cam {cam_idx}] feed ended")
+                    break
+
+            capture_idx += 1
+            now = time.time()
+            _fps_val[0] = 1.0 / max(now - _t_fps[0], 1e-3)
+            _t_fps[0]   = now
+
+            # Hand latest frame to pipeline thread (non-blocking)
+            with _buf_lock:
+                _buf_frame[0] = frame
+                _buf_fid[0]   = capture_idx
+                out    = _buf_out[0]
+                n_attn = _buf_nattn[0]
+
+            # Annotate with last-known results and push to stream at full fps
+            vis = frame.copy()
+            if out:
+                draw_phones(vis, out.phones)
+                for track_id, bbox, result in out.faces:
+                    draw_face(vis, track_id, bbox, result)
+                draw_hud(vis, capture_idx, len(out.faces), n_attn, _fps_val[0])
+
+            jpg = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
+            with _lock:
+                _frames[cam_idx] = jpg
+
+            if not no_display:
+                cv2.imshow(f"attention cam{cam_idx}", vis)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    _stop_event.set()
+                    break
+
+            if max_frames and capture_idx >= max_frames:
+                break
+    finally:
+        cap.release()
+        try:
+            pipe.close()
         except Exception:
             pass
 
-def _start_stream_server(port=8080):
-    server = HTTPServer(("0.0.0.0", port), _MjpegHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    return port
-# ─────────────────────────────────────────────────────────────────────────────
 
-
-def open_source(src):
-    """Accepts a file path or an integer camera index."""
-    import platform
-    try:
-        idx = int(src)
-        if platform.system() == "Windows":
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)  # DirectShow avoids 0-frame issue on Windows
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(idx)
-        else:
-            cap = cv2.VideoCapture(idx)  # V4L2 default on Linux/Pi
-        return cap
-    except ValueError:
-        return cv2.VideoCapture(str(src))
-
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--source", required=True, help="video file path or camera index")
-    ap.add_argument("--source2", default=None, help="optional second source")
-    ap.add_argument("--out", default=None, help="path to write annotated output video (first camera only)")
-    ap.add_argument("--no-display", action="store_true")
-    ap.add_argument("--stream", action="store_true", help="serve MJPEG stream on port 8080")
-    ap.add_argument("--session", default=None, help="session id (default: uuid)")
+    global _db_path, _session_id
+
+    ap = argparse.ArgumentParser(
+        description="Multi-camera attention tracker with live web dashboard"
+    )
+    ap.add_argument(
+        "--source", default=None,
+        help="comma-separated camera indices (e.g. '0,1') or omit to auto-detect"
+    )
+    ap.add_argument("--no-display", action="store_true",
+                    help="headless mode — no OpenCV window")
+    ap.add_argument("--stream", action="store_true",
+                    help="serve web dashboard on port 8080")
+    ap.add_argument("--session", default=None)
     ap.add_argument("--db", default=config.DB_PATH)
+    ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--max-frames", type=int, default=None,
-                    help="stop after N frames (for quick testing)")
+                    help="stop each camera after N frames (testing)")
     args = ap.parse_args()
 
     session_id = args.session or f"session_{int(time.time())}"
-    print(f"[info] session_id = {session_id}")
+    _session_id = session_id
+    # Always store absolute path so HTTP thread can find the DB regardless of cwd
+    _db_path = str(Path(args.db).resolve())
+    print(f"[info] session_id = {session_id}", flush=True)
 
-    if args.stream:
-        port = _start_stream_server()
-        print(f"[info] MJPEG stream at http://<pi-ip>:{port}")
+    # Start HTTP server first so dashboard is reachable during camera init
+    if args.stream or args.no_display:
+        _start_server(args.port)
 
-    # Open sources
-    cap1 = open_source(args.source)
-    if not cap1.isOpened():
-        print(f"[error] could not open source: {args.source}")
-        print("[hint]  run: ls /dev/video*  to see available cameras")
-        print("[hint]  if permission denied: sudo usermod -aG video $USER  then reboot")
+    # Determine camera list
+    if args.source:
+        cam_indices = [int(x.strip()) for x in args.source.split(",")]
+    else:
+        print("[info] auto-detecting cameras…", flush=True)
+        cam_indices = detect_cameras()
+
+    if not cam_indices:
+        print("[error] no cameras found", flush=True)
+        print("[hint]  plug in a USB webcam, or pass --source 0 explicitly")
         return 1
-    cap2 = None
-    if args.source2:
-        cap2 = open_source(args.source2)
-        if not cap2.isOpened():
-            print(f"[error] could not open source2: {args.source2}")
-            return 1
 
-    # Writer (from cam1 properties)
-    writer = None
-    if args.out:
-        w = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap1.get(cv2.CAP_PROP_FPS) or config.OUTPUT_FPS
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.out, fourcc, fps, (w, h))
-        print(f"[info] writing output to {args.out} @ {w}x{h} {fps:.1f}fps")
+    # Scale analysis frequency so CPU stays at ~100% regardless of camera count.
+    # Fewer cameras → more analysis passes per second (more work per thread).
+    # More cameras → less frequent analysis so all threads can keep up.
+    _analysis_scale = {1: 10, 2: 15, 3: 20}
+    analysis_every = _analysis_scale.get(len(cam_indices), 25)
+    print(f"[info] running on cameras: {cam_indices}  "
+          f"analysis_every={analysis_every} frames", flush=True)
 
-    # Logger (one DB, both cameras write)
-    logger = AttentionLogger(args.db, session_id, video_source=str(args.source))
+    logger = AttentionLogger(args.db, session_id, video_source=str(cam_indices))
 
-    # Pipelines (one per camera)
-    src_name_1 = str(args.source)
-    pipe1 = Pipeline(camera_id=1, logger=logger)
-    pipe2 = Pipeline(camera_id=2, logger=logger) if cap2 else None
-
-    frame_idx = 0
-    t_start = time.time()
-    t_last = t_start
+    threads = []
+    for idx in cam_indices:
+        t = threading.Thread(
+            target=_camera_worker,
+            args=(idx, logger, session_id, args.no_display, args.max_frames, analysis_every),
+            daemon=True,
+            name=f"cam-{idx}",
+        )
+        t.start()
+        threads.append(t)
 
     try:
-        while True:
-            ok1, frame1 = cap1.read()
-            if not ok1:
-                break
-
-            out1 = pipe1.process(frame1)
-
-            frame2 = None
-            out2 = None
-            if cap2 is not None:
-                ok2, frame2 = cap2.read()
-                if ok2:
-                    out2 = pipe2.process(frame2)
-
-            frame_idx += 1
-
-            # Draw
-            if not args.no_display or writer is not None or args.stream:
-                vis = frame1.copy()
-                draw_phones(vis, out1.phones)
-                for track_id, bbox, result in out1.faces:
-                    draw_face(vis, track_id, bbox, result)
-
-                now = time.time()
-                fps = 1.0 / max(now - t_last, 1e-3)
-                t_last = now
-                n_attn = sum(1 for _, _, r in out1.faces if r.attentive)
-                draw_hud(vis, frame_idx, len(out1.faces), n_attn, fps)
-
-                if writer is not None:
-                    writer.write(vis)
-
-                if args.stream:
-                    _set_stream_frame(vis)
-
-                if not args.no_display:
-                    cv2.imshow("attention cam1", vis)
-                    if frame2 is not None and out2 is not None:
-                        vis2 = frame2.copy()
-                        draw_phones(vis2, out2.phones)
-                        for track_id, bbox, result in out2.faces:
-                            draw_face(vis2, track_id, bbox, result)
-                        draw_hud(vis2, frame_idx, len(out2.faces),
-                                 sum(1 for _, _, r in out2.faces if r.attentive), fps)
-                        cv2.imshow("attention cam2", vis2)
-
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        print("[info] quit requested")
-                        break
-
-            if frame_idx % 30 == 0:
-                elapsed = time.time() - t_start
-                print(f"[info] frame {frame_idx}  avg {frame_idx/elapsed:.2f} fps  "
-                      f"cam1 faces={len(out1.faces)} rejected={len(out1.rejected)}")
-
-            if args.max_frames and frame_idx >= args.max_frames:
-                break
-
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("[info] stopping…")
+        _stop_event.set()
     finally:
-        cap1.release()
-        if cap2 is not None:
-            cap2.release()
-        if writer is not None:
-            writer.release()
-        cv2.destroyAllWindows()
-        pipe1.close()
-        if pipe2 is not None:
-            pipe2.close()
+        # Give threads a moment to exit cleanly
+        for t in threads:
+            t.join(timeout=3)
         logger.close()
+        cv2.destroyAllWindows()
 
-    total = time.time() - t_start
-    print(f"[done] {frame_idx} frames in {total:.1f}s = {frame_idx/total:.2f} fps")
     print(f"[done] session_id = {session_id}")
     print(f"[done] DB: {args.db}")
-    print(f"[next] run: python -m scripts.generate_report --session {session_id} --db {args.db}")
+    print(f"[next] python generate_report.py --session {session_id} --db {args.db}")
     return 0
 
 

@@ -21,7 +21,7 @@ class FrameOutput:
 
 
 class Pipeline:
-    def __init__(self, camera_id: int, logger=None):
+    def __init__(self, camera_id: int, logger=None, analysis_every: int = None):
         self.camera_id = camera_id
         self.logger = logger
         self.detector = FaceDetector()
@@ -30,10 +30,13 @@ class Pipeline:
         self.frame_idx = 0
         self._last_phones: list = []
         self._last_results: dict = {}   # track_id -> AttentionResult
+        # Allow caller to override global config (scaled per camera count)
+        self._analysis_every = analysis_every if analysis_every is not None \
+            else config.ATTENTION_ANALYSIS_EVERY_N_FRAMES
 
     def process(self, frame) -> FrameOutput:
         self.frame_idx += 1
-        do_analysis = (self.frame_idx % config.ATTENTION_ANALYSIS_EVERY_N_FRAMES == 0)
+        do_analysis = (self.frame_idx % self._analysis_every == 0)
 
         # --- Always: face detection + quality gate + tracking ---
         faces = self.detector.detect(frame)
