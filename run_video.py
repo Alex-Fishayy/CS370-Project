@@ -18,6 +18,7 @@ Usage:
 """
 import argparse
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -90,43 +91,83 @@ def main():
     logger = AttentionLogger(args.db, session_id, video_source=str(args.source))
 
     # Pipelines (one per camera)
-    src_name_1 = str(args.source)
     pipe1 = Pipeline(camera_id=1, logger=logger)
     pipe2 = Pipeline(camera_id=2, logger=logger) if cap2 else None
 
+    # ── Shared buffers: capture loop writes frames, pipeline threads read them ─
+    _buf_lock = threading.Lock()
+    _buf1 = {"frame": None, "fid": 0, "out": None}
+    _buf2 = {"frame": None, "fid": 0, "out": None}
+    _stop_ev = threading.Event()
+
+    def _pipeline_thread(pipe, buf):
+        last_fid = 0
+        while not _stop_ev.is_set():
+            with _buf_lock:
+                fid   = buf["fid"]
+                frame = buf["frame"]
+            if frame is None or fid == last_fid:
+                time.sleep(0.002)
+                continue
+            last_fid = fid
+            out = pipe.process(frame)
+            with _buf_lock:
+                buf["out"] = out
+
+    t1 = threading.Thread(target=_pipeline_thread, args=(pipe1, _buf1), daemon=True)
+    t1.start()
+    t2 = None
+    if pipe2:
+        t2 = threading.Thread(target=_pipeline_thread, args=(pipe2, _buf2), daemon=True)
+        t2.start()
+
+    # ── Capture + display loop — always runs at ~30 fps ───────────────────────
+    _TARGET_FRAME_S = 1.0 / 30.0
     frame_idx = 0
-    t_start = time.time()
-    t_last = t_start
+    t_start   = time.time()
+    t_last    = t_start
 
     try:
         while True:
+            t_frame_start = time.time()
+
             ok1, frame1 = cap1.read()
             if not ok1:
                 break
 
-            out1 = pipe1.process(frame1)
-
-            frame2 = None
-            out2 = None
-            if cap2 is not None:
-                ok2, frame2 = cap2.read()
-                if ok2:
-                    out2 = pipe2.process(frame2)
-
             frame_idx += 1
 
-            # Draw
+            frame2 = None
+            if cap2 is not None:
+                ok2, frame2 = cap2.read()
+                if not ok2:
+                    frame2 = None
+
+            # Hand frames to pipeline threads (non-blocking)
+            with _buf_lock:
+                _buf1["frame"] = frame1
+                _buf1["fid"]   = frame_idx
+                out1 = _buf1["out"]
+
+                if frame2 is not None:
+                    _buf2["frame"] = frame2
+                    _buf2["fid"]   = frame_idx
+                out2 = _buf2["out"]
+
+            # Draw with last-known pipeline results (may be None on first frames)
             if not args.no_display or writer is not None:
                 vis = frame1.copy()
-                draw_phones(vis, out1.phones)
-                for track_id, bbox, result in out1.faces:
-                    draw_face(vis, track_id, bbox, result)
+                if out1 is not None:
+                    draw_phones(vis, out1.phones)
+                    for track_id, bbox, result in out1.faces:
+                        draw_face(vis, track_id, bbox, result)
 
                 now = time.time()
                 fps = 1.0 / max(now - t_last, 1e-3)
                 t_last = now
-                n_attn = sum(1 for _, _, r in out1.faces if r.attentive)
-                draw_hud(vis, frame_idx, len(out1.faces), n_attn, fps)
+                n_faces = len(out1.faces) if out1 else 0
+                n_attn  = sum(1 for _, _, r in out1.faces if r.attentive) if out1 else 0
+                draw_hud(vis, frame_idx, n_faces, n_attn, fps)
 
                 if writer is not None:
                     writer.write(vis)
@@ -148,13 +189,20 @@ def main():
 
             if frame_idx % 30 == 0:
                 elapsed = time.time() - t_start
+                n_rej = len(out1.rejected) if out1 else 0
                 print(f"[info] frame {frame_idx}  avg {frame_idx/elapsed:.2f} fps  "
-                      f"cam1 faces={len(out1.faces)} rejected={len(out1.rejected)}")
+                      f"cam1 faces={n_faces} rejected={n_rej}")
 
             if args.max_frames and frame_idx >= args.max_frames:
                 break
 
+            # Sleep out remaining budget to hold ~30 fps display
+            spare = _TARGET_FRAME_S - (time.time() - t_frame_start)
+            if spare > 0:
+                time.sleep(spare)
+
     finally:
+        _stop_ev.set()
         cap1.release()
         if cap2 is not None:
             cap2.release()
