@@ -136,24 +136,39 @@ def _open_cam(idx: int):
         if not cap.isOpened():
             cap = cv2.VideoCapture(idx)
     else:
-        cap = cv2.VideoCapture(idx)
-    # Force 720p on every camera
+        # On Linux/Pi, open by device path to bypass V4L2 enumeration gaps.
+        # /dev/video0, /dev/video2, etc. are skipped when using integer indices
+        # if the kernel assigns non-contiguous nodes (e.g. metadata devices).
+        cap = cv2.VideoCapture(f"/dev/video{idx}", cv2.CAP_V4L2)
     if cap.isOpened():
+        # Force MJPEG before setting resolution — YUYV at 1280x720 saturates USB
+        # bandwidth on the Pi and causes V4L2 select() timeouts.  MJPEG compresses
+        # on-camera so the USB payload is ~10x smaller.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # minimise latency / stale frames
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     return cap
 
 
-def detect_cameras(max_index: int = 8) -> list:
-    """Try indices 0..max_index-1, return those that open and deliver a frame."""
+def detect_cameras(max_index: int = 32) -> list:
+    """Scan /dev/video0../dev/video(max_index-1), return indices that deliver frames.
+
+    On Raspberry Pi, UVC webcams may appear at non-contiguous indices (e.g. 0 and 2)
+    because metadata/ISP devices occupy the gaps.  We probe every slot directly by
+    device path rather than relying on OpenCV's V4L2 enumeration.
+    """
     found = []
     for i in range(max_index):
+        dev = f"/dev/video{i}"
+        if not os.path.exists(dev):
+            continue
         cap = _open_cam(i)
         if cap.isOpened():
             ok, _ = cap.read()
             if ok:
                 found.append(i)
-                print(f"[info] found camera {i}")
+                print(f"[info] found camera {i} ({dev})", flush=True)
         cap.release()
     return found
 
@@ -196,14 +211,14 @@ _DASHBOARD = """<!DOCTYPE html>
 
 <h2>Live per-camera</h2>
 <table><thead><tr>
-  <th>Camera</th><th>Faces</th><th>Attentive</th><th>Rate</th><th>FPS</th>
+  <th>Camera</th><th>Faces</th><th>Avg Attn%</th><th>FPS</th>
 </tr></thead><tbody id="live-body"></tbody></table>
 
-<h2>DB metrics -- session total</h2>
+<h2>DB metrics -- avg per person</h2>
 <div id="db-error"></div>
 <table><thead><tr>
-  <th>Cam</th><th>Track</th><th>Samples</th>
-  <th>Attn%</th><th>Eyes%</th><th>Pose%</th><th>NoPhone%</th>
+  <th>Cam</th><th>People</th><th>Samples</th>
+  <th>Avg Attn%</th><th>Avg Eyes%</th><th>Avg Pose%</th><th>Avg NoPhone%</th>
 </tr></thead><tbody id="db-body"></tbody></table>
 
 <div id="status">connecting...</div>
@@ -232,11 +247,14 @@ async function refresh() {
       });
     }
 
-    // Live table
+    // Live table — use DB per-person avg when available, else fall back to live ratio
+    const dbAvg = {};
+    (d.db_rows || []).forEach(r => { dbAvg[r.cam] = r.attn_pct; });
     let live = '';
     (d.live || []).forEach(s => {
-      const rate = s.faces > 0 ? Math.round(100 * s.attentive / s.faces) : 0;
-      live += `<tr><td>Cam ${s.cam}</td><td>${s.faces}</td><td>${s.attentive}</td>` +
+      const rate = dbAvg[s.cam] != null ? dbAvg[s.cam]
+                   : (s.faces > 0 ? Math.round(100 * s.attentive / s.faces) : 0);
+      live += `<tr><td>Cam ${s.cam}</td><td>${s.faces}</td>` +
               `<td class="${cls(rate)}">${rate}%</td><td>${s.fps}</td></tr>`;
     });
     document.getElementById('live-body').innerHTML = live;
@@ -245,7 +263,7 @@ async function refresh() {
     let db = '';
     if (d.db_rows && d.db_rows.length) {
       d.db_rows.forEach(row => {
-        db += `<tr><td>${row.cam}</td><td>#${row.track}</td><td>${row.n}</td>` +
+        db += `<tr><td>${row.cam}</td><td>${row.people}</td><td>${row.n}</td>` +
               `<td class="${cls(row.attn_pct)}">${row.attn_pct}%</td>` +
               `<td class="${cls(row.eyes_pct)}">${row.eyes_pct}%</td>` +
               `<td class="${cls(row.pose_pct)}">${row.pose_pct}%</td>` +
@@ -333,21 +351,31 @@ class _Handler(BaseHTTPRequestHandler):
                                            check_same_thread=False)
                     conn.execute("PRAGMA journal_mode=WAL")
                     rows = conn.execute(
-                        """SELECT camera_id, track_id,
-                                  COUNT(*) AS n,
-                                  ROUND(100.0*SUM(attentive)/COUNT(*), 1),
-                                  ROUND(100.0*SUM(eyes_open)/COUNT(*), 1),
-                                  ROUND(100.0*SUM(head_pose_ok)/COUNT(*), 1),
-                                  ROUND(100.0*SUM(no_phone)/COUNT(*), 1)
-                           FROM measurements
-                           WHERE session_id=?
-                           GROUP BY camera_id, track_id
-                           ORDER BY camera_id, track_id""",
+                        """WITH pp AS (
+                             SELECT camera_id, track_id,
+                                    1.0*SUM(attentive)/COUNT(*)    AS attn,
+                                    1.0*SUM(eyes_open)/COUNT(*)    AS eyes,
+                                    1.0*SUM(head_pose_ok)/COUNT(*) AS pose,
+                                    1.0*SUM(no_phone)/COUNT(*)     AS nophone,
+                                    COUNT(*) AS n
+                             FROM measurements WHERE session_id=?
+                             GROUP BY camera_id, track_id
+                           )
+                           SELECT camera_id,
+                                  COUNT(*) AS people,
+                                  SUM(n)   AS total_n,
+                                  ROUND(100.0*AVG(attn),    1),
+                                  ROUND(100.0*AVG(eyes),    1),
+                                  ROUND(100.0*AVG(pose),    1),
+                                  ROUND(100.0*AVG(nophone), 1)
+                           FROM pp
+                           GROUP BY camera_id
+                           ORDER BY camera_id""",
                         (_session_id,),
                     ).fetchall()
                     conn.close()
                     db_rows = [
-                        {"cam": r[0], "track": r[1], "n": r[2],
+                        {"cam": r[0], "people": r[1], "n": r[2],
                          "attn_pct": r[3] or 0, "eyes_pct": r[4] or 0,
                          "pose_pct": r[5] or 0, "nophone_pct": r[6] or 0}
                         for r in rows
@@ -443,17 +471,31 @@ def _camera_worker(cam_idx: int, logger: AttentionLogger, session_id: str,
     pt = threading.Thread(target=_pipeline_loop, daemon=True, name=f"pipeline-{cam_idx}")
     pt.start()
 
-    # ── Capture loop — runs at camera fps (~30 fps) ───────────────────────────
+    # ── Capture loop — always runs at ~30 fps; pipeline analysis is decoupled ──
+    _TARGET_FRAME_S = 1.0 / 30.0
     capture_idx = 0
+    _consecutive_fail = 0
     try:
         while not _stop_event.is_set():
+            t_frame_start = time.time()   # stamp before cap.read() for accurate budget
+
             ok, frame = cap.read()
             if not ok:
+                _consecutive_fail += 1
                 time.sleep(0.05)
-                ok, frame = cap.read()
-                if not ok:
-                    print(f"[cam {cam_idx}] feed ended")
-                    break
+                if _consecutive_fail >= 20:  # ~1 second of failures → reconnect
+                    print(f"[cam {cam_idx}] read timeout — reconnecting…", flush=True)
+                    cap.release()
+                    time.sleep(1.0)
+                    cap = _open_cam(cam_idx)
+                    if not cap.isOpened():
+                        print(f"[cam {cam_idx}] reconnect failed — retrying in 5s", flush=True)
+                        time.sleep(5.0)
+                    else:
+                        print(f"[cam {cam_idx}] reconnected", flush=True)
+                    _consecutive_fail = 0
+                continue
+            _consecutive_fail = 0
 
             capture_idx += 1
             now = time.time()
@@ -487,6 +529,13 @@ def _camera_worker(cam_idx: int, logger: AttentionLogger, session_id: str,
 
             if max_frames and capture_idx >= max_frames:
                 break
+
+            # Sleep out any remaining budget so display stays at 30 fps.
+            # t_frame_start was captured before cap.read(), so this correctly
+            # accounts for both the read and the annotation time.
+            spare = _TARGET_FRAME_S - (time.time() - t_frame_start)
+            if spare > 0:
+                time.sleep(spare)
     finally:
         cap.release()
         try:
@@ -542,8 +591,8 @@ def main():
     # Scale analysis frequency so CPU stays at ~100% regardless of camera count.
     # Fewer cameras → more analysis passes per second (more work per thread).
     # More cameras → less frequent analysis so all threads can keep up.
-    _analysis_scale = {1: 10, 2: 15, 3: 20}
-    analysis_every = _analysis_scale.get(len(cam_indices), 25)
+    _analysis_scale = {1: 10, 2: 25, 3: 30}
+    analysis_every = _analysis_scale.get(len(cam_indices), 35)
     print(f"[info] running on cameras: {cam_indices}  "
           f"analysis_every={analysis_every} frames", flush=True)
 
